@@ -188,6 +188,7 @@ class Detector:
                     await asyncio.gather(
                         self._event_dispatcher(w3),
                         self._alert_updater(),
+                        self._telemetry_heartbeat(),
                     )
             except Exception as exc:
                 logger.error(
@@ -338,7 +339,7 @@ class Detector:
             cs.window.append((now, minter))
 
         # Log every mint so activity is visible before surge threshold is crossed
-        logger.debug(
+        logger.info(
             "Mint detected: contract=%s minter=%s qty=%d window_size=%d",
             contract_address, minter, mint_qty, len(cs.window)
         )
@@ -457,6 +458,20 @@ class Detector:
                     await alerter.update_alert(contract_address, update)
                 except Exception as exc:
                     logger.warning("Update alert error for %s: %s", contract_address, exc)
+
+    async def _telemetry_heartbeat(self) -> None:
+        """Periodically log system health and active monitoring stats every 60 seconds."""
+        while True:
+            await asyncio.sleep(60)
+            active_contracts = len(self.surge_windows)
+            active_surges = sum(1 for cs in self.surge_windows.values() if cs.state == SurgeState.SURGING)
+            logger.info(
+                "📡 Telemetry Pulse: Provider=%s | Monitored Contracts=%d | Active Surges=%d | Latest Block=%s",
+                self.active_provider_name,
+                active_contracts,
+                active_surges,
+                self._last_processed_block or "Connecting...",
+            )
 
     # -----------------------------------------------------------------------
     # Unified event dispatcher (web3.py 7 compatible)
