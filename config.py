@@ -36,13 +36,13 @@ ETHERSCAN_API_KEY: str = os.environ["ETHERSCAN_API_KEY"]
 # ---------------------------------------------------------------------------
 
 # Mints within WINDOW_SECONDS to trigger a surge alert
-SURGE_THRESHOLD: int = int(os.getenv("SURGE_THRESHOLD", "20"))
+SURGE_THRESHOLD: int = int(os.getenv("SURGE_THRESHOLD", "10"))
 
 # Minimum unique minters required alongside the threshold crossing
-MIN_UNIQUE_MINTERS: int = 8
+MIN_UNIQUE_MINTERS: int = int(os.getenv("MIN_UNIQUE_MINTERS", "4"))
 
 # Rolling window duration in seconds
-WINDOW_SECONDS: int = 60
+WINDOW_SECONDS: int = int(os.getenv("WINDOW_SECONDS", "60"))
 
 # Velocity (mints/window) below which a mint is considered ended
 VELOCITY_FLOOR: int = 3

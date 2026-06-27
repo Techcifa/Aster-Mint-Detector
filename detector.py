@@ -56,6 +56,65 @@ ALL_TOPICS = [
     ERC1155_TRANSFER_SINGLE_TOPIC,
     ERC1155_TRANSFER_BATCH_TOPIC,
 ]
+# Pre-lowercase for fast comparison
+ALL_TOPICS_LOWER = {t.lower() for t in ALL_TOPICS}
+
+
+# ---------------------------------------------------------------------------
+# Topic & Subscription helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_sub_id(sub_id: any) -> str:
+    if sub_id is None:
+        return ""
+    if isinstance(sub_id, bytes):
+        return sub_id.hex().lower()
+    val = str(sub_id).lower()
+    if val.startswith("0x"):
+        return val
+    return "0x" + val
+
+
+def _topic_to_hex(topic: any) -> str:
+    if topic is None:
+        return ""
+    if isinstance(topic, bytes):
+        return "0x" + topic.hex()
+    val = str(topic).lower()
+    if not val.startswith("0x"):
+        return "0x" + val
+    return val
+
+
+def _is_zero_address(topic: any) -> bool:
+    if topic is None:
+        return False
+    try:
+        hex_str = _topic_to_hex(topic)
+        return int(hex_str, 16) == 0
+    except (ValueError, TypeError):
+        return False
+
+
+def _extract_address_from_topic(topic: any) -> str:
+    hex_str = _topic_to_hex(topic)
+    if len(hex_str) >= 42:
+        return "0x" + hex_str[-40:]
+    return "0x0000000000000000000000000000000000000000"
+
+
+def _parse_block_number(val: any) -> int | None:
+    if val is None:
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, str):
+        try:
+            return int(val, 16) if val.startswith("0x") else int(val)
+        except ValueError:
+            return None
+    return None
+
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +163,9 @@ class Detector:
         if len(self._providers) == 1:
             logger.info("Running in Alchemy-only mode (no QuickNode fallback configured).")
         self._primary_index: int = 0  # which provider is "current"
+
+        # Block tracking for historical reconnect catch-up
+        self._last_processed_block: int | None = None
 
     # -----------------------------------------------------------------------
     # Public entry point
@@ -192,11 +254,22 @@ class Detector:
             except Exception:
                 return
 
+        block_num = _parse_block_number(log.get("blockNumber"))
+        if block_num is not None:
+            if self._last_processed_block is None or block_num > self._last_processed_block:
+                self._last_processed_block = block_num
+
         topics = log.get("topics", [])
         if not topics:
             return
 
-        topic0 = topics[0].hex() if isinstance(topics[0], bytes) else topics[0]
+        topic0_raw = topics[0].hex() if isinstance(topics[0], bytes) else topics[0]
+        topic0 = topic0_raw.lower()
+
+        # Fast reject — skip events that are not any of the 3 mint signatures
+        if topic0 not in ALL_TOPICS_LOWER:
+            return
+
         contract_address = log.get("address", "").lower()
         if not contract_address:
             return
@@ -204,34 +277,49 @@ class Detector:
         minter: str | None = None
         mint_qty: int = 1
 
-        # ERC-721 Transfer from zero address
-        if topic0 == ERC721_TRANSFER_TOPIC and len(topics) >= 2:
-            from_topic = topics[1].hex() if isinstance(topics[1], bytes) else topics[1]
-            if from_topic.lower() == ZERO_ADDRESS_PADDED.lower():
-                # to is topics[2]
+        # ERC-721 Transfer from zero address: Transfer(address from, address to, uint256 tokenId)
+        if topic0 == ERC721_TRANSFER_TOPIC.lower() and len(topics) >= 2:
+            if _is_zero_address(topics[1]):
                 if len(topics) >= 3:
-                    to_topic = topics[2].hex() if isinstance(topics[2], bytes) else topics[2]
-                    minter = "0x" + to_topic[-40:]
+                    minter = _extract_address_from_topic(topics[2])
                 else:
                     minter = "0x0000000000000000000000000000000000000000"
 
-        # ERC-1155 TransferSingle from zero address (from is topics[2])
-        elif topic0 == ERC1155_TRANSFER_SINGLE_TOPIC and len(topics) >= 3:
-            from_topic = topics[2].hex() if isinstance(topics[2], bytes) else topics[2]
-            if from_topic.lower() == ZERO_ADDRESS_PADDED.lower():
+        # ERC-1155 TransferSingle — topics: [sig, operator, from, to] (all indexed)
+        elif topic0 == ERC1155_TRANSFER_SINGLE_TOPIC.lower() and len(topics) >= 3:
+            if _is_zero_address(topics[2]):
                 if len(topics) >= 4:
-                    to_topic = topics[3].hex() if isinstance(topics[3], bytes) else topics[3]
+                    minter = _extract_address_from_topic(topics[3])
                 else:
-                    to_topic = topics[2]
-                minter = "0x" + to_topic[-40:]
+                    minter = _extract_address_from_topic(topics[2])
+                # Extract value (mint quantity) from log data
+                data = log.get("data", "0x")
+                if isinstance(data, bytes):
+                    data_bytes = data
+                elif isinstance(data, str) and data.startswith("0x"):
+                    data_bytes = bytes.fromhex(data[2:])
+                else:
+                    data_bytes = b""
+                if len(data_bytes) >= 64:
+                    # id is first 32 bytes (0..32), value is second 32 bytes (32..64)
+                    val = int.from_bytes(data_bytes[32:64], "big")
+                    mint_qty = max(val, 1)
 
-        # ERC-1155 TransferBatch from zero address (from is topics[2])
-        elif topic0 == ERC1155_TRANSFER_BATCH_TOPIC and len(topics) >= 3:
-            from_topic = topics[2].hex() if isinstance(topics[2], bytes) else topics[2]
-            if from_topic.lower() == ZERO_ADDRESS_PADDED.lower():
+        # ERC-1155 TransferBatch — topics: [sig, operator, from, to] (all indexed)
+        elif topic0 == ERC1155_TRANSFER_BATCH_TOPIC.lower() and len(topics) >= 3:
+            if _is_zero_address(topics[2]):
+                if len(topics) >= 4:
+                    minter = _extract_address_from_topic(topics[3])
+                else:
+                    minter = _extract_address_from_topic(topics[2])
                 # Count tokens from data: ids array length
                 data = log.get("data", "0x")
-                data_bytes = bytes.fromhex(data[2:]) if data and data.startswith("0x") else b""
+                if isinstance(data, bytes):
+                    data_bytes = data
+                elif isinstance(data, str) and data.startswith("0x"):
+                    data_bytes = bytes.fromhex(data[2:])
+                else:
+                    data_bytes = b""
                 if len(data_bytes) >= 96:
                     ids_offset = int.from_bytes(data_bytes[0:32], "big")
                     if ids_offset + 32 <= len(data_bytes):
@@ -239,9 +327,6 @@ class Detector:
                             data_bytes[ids_offset: ids_offset + 32], "big"
                         )
                         mint_qty = max(ids_length, 1)
-                if len(topics) >= 4:
-                    to_topic = topics[3].hex() if isinstance(topics[3], bytes) else topics[3]
-                    minter = "0x" + to_topic[-40:]
 
         if minter is None:
             return
@@ -251,6 +336,12 @@ class Detector:
         cs = self.surge_windows[contract_address]
         for _ in range(mint_qty):
             cs.window.append((now, minter))
+
+        # Log every mint so activity is visible before surge threshold is crossed
+        logger.debug(
+            "Mint detected: contract=%s minter=%s qty=%d window_size=%d",
+            contract_address, minter, mint_qty, len(cs.window)
+        )
 
         await self._check_surge(contract_address, w3)
 
@@ -272,6 +363,17 @@ class Detector:
         minters = [entry[1] for entry in cs.window]
         unique_minters = len(set(minters))
         velocity = mint_count  # mints within last WINDOW_SECONDS
+
+        # Log progress every 5 mints so we can see the window filling
+        if mint_count > 0 and mint_count % 5 == 0:
+            logger.info(
+                "[%s] window=%d mints / %d unique (threshold=%d / %d unique)",
+                contract_address[:10],
+                mint_count,
+                unique_minters,
+                config.SURGE_THRESHOLD,
+                config.MIN_UNIQUE_MINTERS,
+            )
 
         if cs.state == SurgeState.IDLE:
             if velocity >= config.SURGE_THRESHOLD and unique_minters >= config.MIN_UNIQUE_MINTERS:
@@ -386,6 +488,31 @@ class Detector:
         except Exception as exc:
             logger.warning("Mempool subscription failed: %s — running without mempool watcher", exc)
 
+        # Historical catch-up on connection / reconnection
+        try:
+            current_block = await w3.eth.block_number
+            if self._last_processed_block is not None and current_block > self._last_processed_block:
+                from_block = self._last_processed_block + 1
+                logger.info(
+                    "Catching up historical logs from block %d to %d...",
+                    from_block,
+                    current_block,
+                )
+                past_logs = await w3.eth.get_logs({
+                    "fromBlock": hex(from_block),
+                    "toBlock": hex(current_block),
+                    "topics": [ALL_TOPICS],
+                })
+                logger.info("Found %d historical logs during catch-up", len(past_logs))
+                for past_log in past_logs:
+                    await self._process_log(w3, past_log)
+            self._last_processed_block = current_block
+        except Exception as exc:
+            logger.warning("Historical log catch-up error: %s", exc)
+
+        norm_log_sub_id = _normalize_sub_id(log_sub_id)
+        norm_pending_sub_id = _normalize_sub_id(pending_sub_id) if pending_sub_id else None
+
         async for payload in w3.socket.process_subscriptions():
             try:
                 # web3.py 7 yields an AttributeDict with keys:
@@ -402,12 +529,14 @@ class Detector:
                     logger.debug("Unrecognised subscription payload type: %s", type(payload))
                     continue
 
-                if sub_id == log_sub_id:
+                norm_sub_id = _normalize_sub_id(sub_id)
+
+                if norm_sub_id == norm_log_sub_id:
                     await self._handle_log(w3, result)
-                elif pending_sub_id is not None and sub_id == pending_sub_id:
+                elif norm_pending_sub_id is not None and norm_sub_id == norm_pending_sub_id:
                     self._handle_pending_tx(result)
                 else:
-                    logger.debug("Unknown subscription id %s — skipping", sub_id)
+                    logger.debug("Unknown subscription id %s (norm: %s) — skipping", sub_id, norm_sub_id)
 
             except Exception as exc:
                 logger.warning("Dispatcher error: %s", exc)

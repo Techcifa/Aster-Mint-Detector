@@ -9,12 +9,17 @@ import logging
 import sys
 
 # Configure structured logging to stdout before importing modules
+# Set root logger to WARNING to silence noisy external libs (web3, websockets, aiogram internals)
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ",
     stream=sys.stdout,
 )
+
+# Enable DEBUG only for our own modules
+for _mod in ("__main__", "detector", "enricher", "alerter"):
+    logging.getLogger(_mod).setLevel(logging.DEBUG)
 
 logger = logging.getLogger(__name__)
 

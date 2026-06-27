@@ -205,7 +205,8 @@ async def _etherscan_block_time(
 async def _eth_call_string(w3: AsyncWeb3, contract_address: str, selector: str) -> str | None:
     """Call a no-arg string-returning function (name() or symbol()) on-chain."""
     try:
-        result = await w3.eth.call({"to": contract_address, "data": selector})
+        target_addr = w3.to_checksum_address(contract_address) if hasattr(w3, "to_checksum_address") else contract_address
+        result = await w3.eth.call({"to": target_addr, "data": selector})
         if not result or len(result) < 96:
             return None
         # ABI-decode: offset (32 bytes) + length (32 bytes) + data
